@@ -1,27 +1,32 @@
-from django.contrib.postgres import serializers
-
+from rest_framework import serializers
 from notebook.models import Category, Notebook
+
 
 class CategorySerializer(serializers.ModelSerializer):
     """
     Serializer for the Category model.
     Converts Category instances to JSON and validates incoming data.
     """
+    note_count = serializers.SerializerMethodField()
+
+    def get_note_count(self, obj):
+        return obj.notes.count()  # count the number of notes associated to the category
 
     class Meta:
         model = Category
-        fields = ('name', 'created_at', 'updated_at')
+        fields = ('id', 'name', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'created_at', 'updated_at')
 
 
 class NotebookSerializer(serializers.ModelSerializer):
     """
     Serializer for the Notebook model.
-
     Adds:
     - a computed field (word_count)
     - validation for title and content
+    - a read-only nested category, plus a separate writable category_id
+    - a request-aware queryset restriction on category_id
     """
-
     # Computed field that does not exist in the database
     word_count = serializers.SerializerMethodField()
 
@@ -31,12 +36,11 @@ class NotebookSerializer(serializers.ModelSerializer):
         'obj' is the Notebook instance currently being serialized.
         Returns the number of words in the content.
         """
-        return len(obj.content.split())
+        return len(obj.body.split())
 
     def validate_title(self, value):
         """
         Field-level validation for the 'title' field.
-
         This method is automatically called by DRF when validating
         the 'title' field during create or update operations.
         """
@@ -46,10 +50,9 @@ class NotebookSerializer(serializers.ModelSerializer):
             )
         return value
 
-    def validate_content(self, value):
+    def validate_body(self, value):
         """
-        Field-level validation for the 'content' field.
-
+        Field-level validation for the 'body' field.
         Ensures that the notebook content is not empty or composed only
         of whitespace.
         """
@@ -59,11 +62,67 @@ class NotebookSerializer(serializers.ModelSerializer):
             )
         return value
 
+    def validate(self, data):
+        """
+        Object-level (cross-field) validation.
+        Called after all individual field validators have passed.
+        Used here because the rule depends on TWO fields at once
+        (is_pinned AND body), which validate_<field> cannot express alone.
+        """
+        if data.get("is_pinned") and len(data.get("body", "")) < 20:
+            raise serializers.ValidationError(
+                "A pinned note must have a body of at least 20 characters."
+            )
+        return data
+
+    # Read side: the full nested Category object, never accepted as input
+    category = CategorySerializer(read_only=True)
+
+    # Write side: accepts only a category primary key (id) as input.
+    # source='category' means DRF writes the resolved Category instance
+    # onto the model's 'category' attribute, even though the API field
+    # is named 'category_id'.
+    # required=False / allow_null=True mirror the model (null=True, blank=True on the FK).
+    category_id = serializers.PrimaryKeyRelatedField(
+        queryset=Category.objects.all(),  # placeholder; narrowed per-request in __init__
+        write_only=True,
+        source='category',
+        required=False,
+        allow_null=True
+    )
+
+    def to_representation(self, instance):
+        """
+        Post-processes the default serialized output.
+        Used here purely for output formatting: reformat created_at as
+        DD/MM/YYYY HH:MM instead of DRF's default ISO format.
+        Does NOT affect validation or what gets written to the database.
+        """
+        rep = super().to_representation(instance)
+        rep['created_at'] = instance.created_at.strftime('%d/%m/%Y %H:%M')
+        return rep
+
+    def __init__(self, *args, **kwargs):
+        """
+        Runs every time this serializer is instantiated (i.e. on every
+        request), unlike the class body above which only runs once,
+        at import time -- before any request or request.user exists.
+
+        Restricts the category_id queryset to categories owned by the
+        currently authenticated user, so a user can never link their
+        notebook to a category that belongs to someone else. This can't
+        be done at field declaration time because request.user is only
+        known once an actual HTTP request comes in.
+        """
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            self.fields['category_id'].queryset = Category.objects.filter(owner=request.user)
+
     class Meta:
         model = Notebook
-
         # Fields exposed by the API
-        fields = ('title', 'content', 'created_at', 'updated_at', 'word_count')
-
+        fields = ('id', 'title', 'body', 'category', 'category_id', 'is_pinned', 'created_at', 'updated_at',
+                  'word_count')
         # Fields automatically generated by the server
         read_only_fields = ('created_at', 'updated_at', 'word_count')
